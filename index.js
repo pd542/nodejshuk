@@ -1,3 +1,4 @@
+const dgram = require('dgram');
 const os = require('os');
 const http = require('http');
 const fs = require('fs');
@@ -46,7 +47,7 @@ const httpServer = http.createServer((req, res) => {
     return;
   } else if (req.url === `/${SUB_PATH}`) {
     const namePart = NAME ? `${NAME}-${ISP}` : ISP;
-    const vlessURL = `vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${WSPATH}#${namePart}`;
+    const vlessURL = `vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${WSPATH}&udp=true#${namePart}`;
     const trojanURL = `trojan://${UUID}@${DOMAIN}:443?security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${WSPATH}#${namePart}`;
     const subscription = vlessURL + '\n' + trojanURL;
     const base64Content = Buffer.from(subscription).toString('base64');
@@ -106,33 +107,185 @@ function resolveHost(host) {
 
 // VLE-SS处理
 function handleVlessConnection(ws, msg) {
-  const [VERSION] = msg;
-  const id = msg.slice(1, 17);
-  if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
-  
-  let i = msg.slice(17, 18).readUInt8() + 19;
-  const port = msg.slice(i, i += 2).readUInt16BE(0);
-  const ATYP = msg.slice(i, i += 1).readUInt8();
-  const host = ATYP == 1 ? msg.slice(i, i += 4).join('.') :
-    (ATYP == 2 ? new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8())) :
-    (ATYP == 3 ? msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':') : ''));
-  ws.send(new Uint8Array([VERSION, 0]));
+  try {
+    const VERSION = msg[0];
+
+    const id = msg.slice(1, 17);
+    if (!id.every((v, i) => v === parseInt(uuid.substr(i * 2, 2), 16))) {
+      return false;
+    }
+
+    const optLen = msg[17];
+    let i = 18 + optLen;
+
+    const command = msg[i++];
+
+    const port = msg.readUInt16BE(i);
+    i += 2;
+
+    const ATYP = msg[i++];
+
+    let host = '';
+
+    if (ATYP === 1) {
+      host = msg.slice(i, i + 4).join('.');
+      i += 4;
+    } else if (ATYP === 2) {
+      const hostLen = msg[i++];
+      host = msg.slice(i, i + hostLen).toString();
+      i += hostLen;
+    } else if (ATYP === 3) {
+      host = msg.slice(i, i + 16)
+        .reduce((s, b, index, arr) => {
+          if (index % 2) {
+            s.push(arr.slice(index - 1, index + 1));
+          }
+          return s;
+        }, [])
+        .map(b => b.readUInt16BE(0).toString(16))
+        .join(':');
+      i += 16;
+    } else {
+      return false;
+    }
+
+    const firstPayload = msg.slice(i);
+
+    if (command === 0x01) {
+      return handleVlessTcp(ws, VERSION, host, port, firstPayload);
+    }
+
+    if (command === 0x02) {
+      handleVlessUdp(ws, VERSION, host, port, firstPayload);
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+function handleVlessTcp(ws, version, host, port, firstPayload) {
+  ws.send(new Uint8Array([version, 0]));
+
   const duplex = createWebSocketStream(ws);
+
   resolveHost(host)
     .then(resolvedIP => {
-      net.connect({ host: resolvedIP, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
+      const socket = net.connect({ host: resolvedIP, port }, function () {
+        if (firstPayload && firstPayload.length > 0) {
+          this.write(firstPayload);
+        }
+
+        duplex
+          .on('error', () => {})
+          .pipe(this)
+          .on('error', () => {})
+          .pipe(duplex);
+      });
+
+      socket.on('error', () => {
+        try { ws.close(); } catch (_) {}
+      });
     })
-    .catch(error => {
-      net.connect({ host, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
+    .catch(() => {
+      const socket = net.connect({ host, port }, function () {
+        if (firstPayload && firstPayload.length > 0) {
+          this.write(firstPayload);
+        }
+
+        duplex
+          .on('error', () => {})
+          .pipe(this)
+          .on('error', () => {})
+          .pipe(duplex);
+      });
+
+      socket.on('error', () => {
+        try { ws.close(); } catch (_) {}
+      });
     });
-  
+
   return true;
+}
+
+function handleVlessUdp(ws, version, host, port, firstPayload) {
+  const duplex = createWebSocketStream(ws);
+  const udpSocket = dgram.createSocket('udp4');
+
+  let closed = false;
+  let cache = Buffer.alloc(0);
+
+  function closeAll() {
+    if (closed) return;
+    closed = true;
+
+    try { udpSocket.close(); } catch (_) {}
+    try { ws.close(); } catch (_) {}
+  }
+
+  ws.on('close', closeAll);
+  ws.on('error', closeAll);
+  duplex.on('error', closeAll);
+  udpSocket.on('error', closeAll);
+
+  ws.send(new Uint8Array([version, 0]));
+
+  function sendUdpPacket(packet) {
+    if (!packet || packet.length === 0) return;
+
+    resolveHost(host)
+      .then(resolvedIP => {
+        udpSocket.send(packet, port, resolvedIP);
+      })
+      .catch(() => {
+        udpSocket.send(packet, port, host);
+      });
+  }
+
+  function feed(data) {
+    cache = Buffer.concat([cache, data]);
+
+    while (cache.length >= 2) {
+      const packetLen = cache.readUInt16BE(0);
+
+      if (packetLen <= 0) {
+        closeAll();
+        return;
+      }
+
+      if (cache.length < 2 + packetLen) {
+        break;
+      }
+
+      const packet = cache.slice(2, 2 + packetLen);
+      cache = cache.slice(2 + packetLen);
+
+      sendUdpPacket(packet);
+    }
+  }
+
+  if (firstPayload && firstPayload.length > 0) {
+    feed(firstPayload);
+  }
+
+  duplex.on('data', chunk => {
+    feed(chunk);
+  });
+
+  udpSocket.on('message', data => {
+    const len = Buffer.alloc(2);
+    len.writeUInt16BE(data.length);
+
+    const packet = Buffer.concat([len, data]);
+
+    try {
+      duplex.write(packet);
+    } catch (_) {
+      closeAll();
+    }
+  });
 }
 
 // Tro-jan处理
